@@ -1,24 +1,16 @@
-# syntax=docker/dockerfile:1
+FROM golang:1.22-alpine AS builder
 
-FROM golang:1.24-alpine AS build
-
-# Set destination for COPY
 WORKDIR /app
+COPY . .
 
-# Download any Go modules
-COPY container_src/go.mod ./
-RUN go mod download
+RUN go mod tidy
+RUN go build -o proxy main.go
 
-# Copy container source code
-COPY container_src/*.go ./
+FROM alpine:3.19
+WORKDIR /app
+COPY --from=builder /app/proxy /app/proxy
 
-# Build
-RUN CGO_ENABLED=0 GOOS=linux go build -o /server
-
-FROM scratch
-COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-COPY --from=build /server /server
+# Porta usada pelo seu servidor Go
 EXPOSE 8080
 
-# Run
-CMD ["/server"]
+CMD ["./proxy"]
