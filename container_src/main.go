@@ -1,61 +1,141 @@
 package main
 
 import (
-	"context"
 	"fmt"
-	"log"
-	"net/http"
+	"io"
+	"net"
 	"os"
-	"os/signal"
-	"syscall"
+	"strings"
+	"sync"
 	"time"
 )
 
-func handler(w http.ResponseWriter, r *http.Request) {
-	message := os.Getenv("MESSAGE")
-	instanceId := os.Getenv("CLOUDFLARE_DURABLE_OBJECT_ID")
-	fmt.Fprintf(w, "Hi, I'm a container and this is my message: \"%s\", my instance ID is: %s", message, instanceId)
+var (
+	TargetAddr = "127.0.0.1"
+)
 
+const (
+	ServerAddr       = "0.0.0.0"
+	ServerPort       = "8080"
+	TargetPortSSH    = "22"
+	TargetPortV2Ray  = "8080"
+	BufferSize       = 524288           // 512 KB
+	KeepAliveTimeout = 24 * time.Hour   // Mantém conexão viva por até 24 horas
+)
+
+type Target struct {
+	Addr  string
+	Port  string
+	V2Ray bool
 }
 
-func errorHandler(w http.ResponseWriter, r *http.Request) {
-	panic("This is a panic")
+func createTarget(endpoint string) *Target {
+	if endpoint == "/ws/" {
+		return &Target{Addr: TargetAddr, Port: TargetPortV2Ray, V2Ray: true}
+	}
+	return &Target{Addr: TargetAddr, Port: TargetPortSSH, V2Ray: false}
+}
+
+func copyStream(src, dst net.Conn, wg *sync.WaitGroup, direction string) {
+	defer wg.Done()
+	buffer := make([]byte, BufferSize)
+	for {
+		n, err := src.Read(buffer)
+		if err != nil {
+			if err != io.EOF {
+				fmt.Printf("[ERROR] Erro ao transferir dados (%s): %v\n", direction, err)
+			}
+			break
+		}
+		if n > 0 {
+			_, err := dst.Write(buffer[:n])
+			if err != nil {
+				fmt.Printf("[ERROR] Erro ao escrever dados (%s): %v\n", direction, err)
+				break
+			}
+		}
+	}
+}
+
+func keepAlive(conns ...net.Conn) {
+	ticker := time.NewTicker(KeepAliveTimeout)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			for _, conn := range conns {
+				if err := conn.SetDeadline(time.Now().Add(KeepAliveTimeout)); err != nil {
+					fmt.Printf("[WARN] Conexão encerrada durante Keep-Alive: %v\n", err)
+					return
+				}
+			}
+		}
+	}
+}
+
+func handleClient(client net.Conn) {
+	defer client.Close()
+
+	clientAddr := client.RemoteAddr().String()
+	fmt.Printf("[INFO] Cliente conectado: %s\n", clientAddr)
+
+	buffer := make([]byte, BufferSize)
+	size, err := client.Read(buffer)
+	if err != nil {
+		fmt.Printf("[ERROR] Falha ao ler do cliente (%s): %v\n", clientAddr, err)
+		return
+	}
+
+	payload := string(buffer[:size])
+	fmt.Printf("[DEBUG] Payload recebido: %s\n", strings.ReplaceAll(payload, "\n", "\\n"))
+
+	endpoint := strings.Split(payload, " ")[1]
+	target := createTarget(endpoint)
+
+	targetConn, err := net.Dial("tcp", net.JoinHostPort(target.Addr, target.Port))
+	if err != nil {
+		fmt.Printf("[ERROR] Falha ao conectar no alvo (%s:%s): %v\n", target.Addr, target.Port, err)
+		return
+	}
+	defer targetConn.Close()
+
+	if target.V2Ray {
+		targetConn.Write(buffer[:size])
+	} else {
+		client.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: Websocket\r\nConnection: Upgrade\r\n\r\n"))
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go copyStream(client, targetConn, &wg, "Cliente -> Alvo")
+	go copyStream(targetConn, client, &wg, "Alvo -> Cliente")
+
+	go keepAlive(client, targetConn)
+
+	wg.Wait()
+	fmt.Printf("[INFO] Conexão encerrada: %s\n", clientAddr)
 }
 
 func main() {
-	// Listen for SIGINT and SIGTERM
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-
-	router := http.NewServeMux()
-	router.HandleFunc("/", handler)
-	router.HandleFunc("/container", handler)
-	router.HandleFunc("/error", errorHandler)
-
-	server := &http.Server{
-		Addr:    ":8080",
-		Handler: router,
+	serverAddr := net.JoinHostPort(ServerAddr, ServerPort)
+	listener, err := net.Listen("tcp", serverAddr)
+	if err != nil {
+		fmt.Printf("[FATAL] Falha ao iniciar o servidor: %v\n", err)
+		os.Exit(1)
 	}
+	defer listener.Close()
 
-	go func() {
-		log.Printf("Server listening on %s\n", server.Addr)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatal(err)
+	fmt.Printf("[INFO] Servidor escutando em %s\n IP:%s\n", serverAddr, TargetAddr)
+
+	for {
+		client, err := listener.Accept()
+		if err != nil {
+			fmt.Printf("[ERROR] Falha ao aceitar conexão: %v\n", err)
+			continue
 		}
-	}()
 
-	// Wait to receive a signal
-	sig := <-stop
-
-	log.Printf("Received signal (%s), shutting down server...", sig)
-
-	// Give the server 5 seconds to shutdown
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := server.Shutdown(ctx); err != nil {
-		log.Fatal(err)
+		go handleClient(client)
 	}
-
-	log.Println("Server shutdown successfully")
 }
